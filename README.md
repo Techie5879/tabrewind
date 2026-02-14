@@ -24,6 +24,14 @@ Many browsers already store history in local SQLite databases, which makes retri
 - sqlite-vec
 - SQLite FTS5/BM25
 
+## local model runtime
+
+tabrewind uses `llama.cpp` for local model execution.
+
+- use any model that is supported by your installed `llama.cpp` build
+- download model files locally before running model-backed workflows
+- no hosted model API is required for this project
+
 ## privacy
 
 Privacy is a core goal of this repo: browser data stays local, processing is local-first, and the project is built to avoid shipping personal browsing data to third-party services.
