@@ -5,7 +5,6 @@ import importlib.util
 import json
 import sqlite3
 import sys
-import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -27,12 +26,10 @@ def _load_app_types_module() -> object:
 
 _APP_TYPES = _load_app_types_module()
 AppConfig = _APP_TYPES.AppConfig
+EncodedEntryPreview = _APP_TYPES.EncodedEntryPreview
 HistoryEntry = _APP_TYPES.HistoryEntry
 IngestSummary = _APP_TYPES.IngestSummary
 ProfileStore = _APP_TYPES.ProfileStore
-VectorPreview = _APP_TYPES.VectorPreview
-WorkerTiming = _APP_TYPES.WorkerTiming
-WorkerSweepResult = _APP_TYPES.WorkerSweepResult
 
 try:
     from rich.console import Console
@@ -55,7 +52,7 @@ CONFIG_FILE_NAME = "config.toml"
 SUPPORTED_BROWSERS = {"zen", "firefox"}
 
 
-class LlamaCppVectorClient:
+class VectorizationClient:
     def __init__(
         self,
         base_url: str,
@@ -173,23 +170,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional one-shot override for max deduped items.",
-    )
-
-    bench = subparsers.add_parser(
-        "bench",
-        help="Run a local concurrency sweep benchmark.",
-    )
-    bench.add_argument(
-        "--sentences",
-        type=int,
-        default=20,
-        help="Number of sentences to benchmark.",
-    )
-    bench.add_argument(
-        "--max-workers",
-        type=int,
-        default=20,
-        help="Maximum worker count in sweep (sweep always includes workers=0 baseline).",
     )
 
     return parser.parse_args()
@@ -570,17 +550,17 @@ def chunk_entries(entries: list[HistoryEntry], batch_size: int) -> list[tuple[in
 
 
 def embed_batch(
-    client: LlamaCppVectorClient,
+    client: VectorizationClient,
     entries: list[HistoryEntry],
     preview_dims: int,
     llm_tags: list[str] | None,
-) -> list[VectorPreview]:
+) -> list[EncodedEntryPreview]:
     inputs = [build_embedding_input(entry) for entry in entries]
     vectors = client.encode_many(inputs)
-    previews: list[VectorPreview] = []
+    previews: list[EncodedEntryPreview] = []
     for entry, vector in zip(entries, vectors, strict=True):
         previews.append(
-            VectorPreview(
+            EncodedEntryPreview(
                 entry=entry,
                 vector_preview=vector[:preview_dims],
                 llm_tags=llm_tags,
@@ -671,7 +651,7 @@ def run_ingest(config: AppConfig) -> IngestSummary:
         else:
             effective_workers = max(1, min(configured_workers, slots))
 
-        vector_client = LlamaCppVectorClient(
+        vector_client = VectorizationClient(
             base_url=config.llama.base_url,
             model=config.llama.model,
             timeout_seconds=config.llama.request_timeout_seconds,
@@ -686,7 +666,7 @@ def run_ingest(config: AppConfig) -> IngestSummary:
             "Requesting embeddings", total=len(deduped_entries)
         )
         embed_errors: list[str] = []
-        previews: list[VectorPreview | None] = [None] * len(deduped_entries)
+        previews: list[EncodedEntryPreview | None] = [None] * len(deduped_entries)
 
         with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = {
@@ -725,58 +705,6 @@ def run_ingest(config: AppConfig) -> IngestSummary:
         previews=finalized_previews,
         load_errors=load_errors,
         embed_errors=embed_errors,
-    )
-
-
-def _run_vectorization_with_workers(
-    client: LlamaCppVectorClient,
-    sentences: list[str],
-    workers: int,
-) -> tuple[list[list[float]], float]:
-    start = time.perf_counter()
-    if workers <= 0:
-        vectors = [client.encode_text(sentence) for sentence in sentences]
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(client.encode_text, sentence) for sentence in sentences]
-            vectors = [future.result() for future in futures]
-    elapsed_seconds = time.perf_counter() - start
-    return vectors, elapsed_seconds
-
-
-def benchmark_worker_sweep(
-    client: LlamaCppVectorClient,
-    sentences: list[str],
-    max_workers: int,
-) -> WorkerSweepResult:
-    if not sentences:
-        raise ValueError("Benchmark requires at least one sentence")
-
-    baseline_vectors, baseline_seconds = _run_vectorization_with_workers(
-        client,
-        sentences,
-        workers=0,
-    )
-
-    timings: list[WorkerTiming] = [
-        WorkerTiming(
-            workers=0,
-            elapsed_seconds=baseline_seconds,
-        )
-    ]
-
-    for workers in range(1, max(1, max_workers) + 1):
-        vectors, elapsed_seconds = _run_vectorization_with_workers(client, sentences, workers)
-        if len(vectors) != len(baseline_vectors):
-            raise RuntimeError("Worker sweep returned mismatched vector counts")
-        timings.append(WorkerTiming(workers=workers, elapsed_seconds=elapsed_seconds))
-
-    vector_dimensions = len(baseline_vectors[0])
-    return WorkerSweepResult(
-        sentence_count=len(sentences),
-        baseline_seconds=baseline_seconds,
-        vector_dimensions=vector_dimensions,
-        timings=timings,
     )
 
 
@@ -848,39 +776,6 @@ def run_ingest_command(args: argparse.Namespace, console: Console) -> int:
     return 0
 
 
-def run_bench_command(args: argparse.Namespace, console: Console) -> int:
-    config = load_config(args.config)
-    max_workers = max(0, args.max_workers)
-
-    sentences = [
-        f"tabrewind benchmark sentence {index} with random-ish token {(index * 17) % 23}"
-        for index in range(max(1, args.sentences))
-    ]
-
-    client = LlamaCppVectorClient(
-        base_url=config.llama.base_url,
-        model=config.llama.model,
-        timeout_seconds=config.llama.request_timeout_seconds,
-        api_key=config.llama.api_key,
-    )
-    result = benchmark_worker_sweep(client, sentences, max_workers=max_workers)
-
-    console.print(f"Worker sweep: 0..{max_workers}")
-    console.print(f"Sentences: {result.sentence_count}")
-    console.print(f"Vector dimensions: {result.vector_dimensions}")
-    console.print(f"Baseline (workers=0): {result.baseline_seconds:.3f}s")
-    for timing in result.timings:
-        speedup = (
-            result.baseline_seconds / timing.elapsed_seconds
-            if timing.elapsed_seconds > 0
-            else 0.0
-        )
-        console.print(
-            f"workers={timing.workers:>2} elapsed={timing.elapsed_seconds:.3f}s speedup={speedup:.2f}x"
-        )
-    return 0
-
-
 def main() -> int:
     args = parse_args()
     console = Console(stderr=False)
@@ -891,9 +786,6 @@ def main() -> int:
         return run_config_command(args, console)
     if args.command == "ingest":
         return run_ingest_command(args, console)
-    if args.command == "bench":
-        return run_bench_command(args, console)
-
     raise RuntimeError(f"Unknown command: {args.command}")
 
 

@@ -74,10 +74,10 @@ Run ingestion and print `vec[:10]` previews:
 uv run main.py ingest --max-items 20
 ```
 
-Run a quick local concurrency benchmark (20 sentences):
+Run the live vectorization smoke test (OpenAI-compatible `/v1/embeddings` on `llama-server`):
 
 ```bash
-uv run main.py bench --sentences 20
+uv run tests/test_vectorization_concurrency.py
 ```
 
 ## privacy

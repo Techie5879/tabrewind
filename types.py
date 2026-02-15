@@ -21,7 +21,7 @@ class ProfileStore:
 
 
 @dataclass(frozen=True)
-class VectorPreview:
+class EncodedEntryPreview:
     entry: HistoryEntry
     vector_preview: list[float]
     llm_tags: list[str] | None
@@ -67,20 +67,6 @@ class IngestSummary:
     loaded_row_count: int
     deduped_row_count: int
     effective_embedding_workers: int
-    previews: list[VectorPreview]
+    previews: list[EncodedEntryPreview]
     load_errors: list[str]
     embed_errors: list[str]
-
-
-@dataclass(frozen=True)
-class WorkerTiming:
-    workers: int
-    elapsed_seconds: float
-
-
-@dataclass(frozen=True)
-class WorkerSweepResult:
-    sentence_count: int
-    baseline_seconds: float
-    vector_dimensions: int
-    timings: list[WorkerTiming]
