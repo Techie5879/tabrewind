@@ -1,3 +1,4 @@
 !.cursor/plans/
 !.cursor/plans/**
 !AGENTS.md
+!config.toml

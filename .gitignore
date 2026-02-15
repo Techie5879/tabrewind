@@ -10,4 +10,8 @@ wheels/
 .venv
 .cursor
 
+# Local runtime config
+config.toml
+
 AGENTS.md
+config.toml
