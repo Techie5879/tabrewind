@@ -74,10 +74,10 @@ Run ingestion and print `vec[:10]` previews:
 uv run main.py ingest --max-items 20
 ```
 
-Run the live vectorization smoke test (OpenAI-compatible `/v1/embeddings` on `llama-server`):
+Run the live vectorization health test (OpenAI-compatible `/v1/embeddings` on `llama-server`):
 
 ```bash
-uv run tests/test_vectorization_concurrency.py
+uv run tests/vectorization_concurrency.py
 ```
 
 ## privacy

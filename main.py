@@ -31,21 +31,16 @@ HistoryEntry = _APP_TYPES.HistoryEntry
 IngestSummary = _APP_TYPES.IngestSummary
 ProfileStore = _APP_TYPES.ProfileStore
 
-try:
-    from rich.console import Console
-    from rich.progress import (
-        BarColumn,
-        MofNCompleteColumn,
-        Progress,
-        SpinnerColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-except ImportError as exc:
-    raise SystemExit(
-        "Missing dependency 'rich'. Install project dependencies with uv sync."
-    ) from exc
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 
 CONFIG_FILE_NAME = "config.toml"
