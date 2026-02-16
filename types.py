@@ -44,6 +44,7 @@ class ProfilesConfig:
 @dataclass
 class IngestConfig:
     browsers: list[str] = field(default_factory=lambda: ["zen", "firefox"])
+    domain_rules: list[str] = field(default_factory=list)
     profile_workers: int = 4
     embedding_workers: int = 4
     embedding_batch_size: int = 8

@@ -13,6 +13,8 @@ wheels/
 
 # Local runtime config
 config.toml
+tabrewind.sqlite
 
 AGENTS.md
 config.toml
+llama.cpp/

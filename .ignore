@@ -3,3 +3,4 @@
 !.cursor/plans/**
 !AGENTS.md
 !config.toml
+!llama.cpp

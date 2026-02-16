@@ -58,6 +58,55 @@ uv run main.py config set ingest.embedding_workers 4
 uv run main.py config set ingest.embedding_batch_size 8
 ```
 
+Configure host filtering rules (top-to-bottom, last match wins):
+
+```bash
+# deny sensitive domains
+uv run main.py domains add --deny "gmail.com"
+uv run main.py domains add --deny "*.gmail.com"
+uv run main.py domains add --deny "*.bank.*"
+
+# allow a specific subdomain after a broad deny
+uv run main.py domains add --allow "mail.google.com"
+
+# inspect, reorder, and validate final decision
+uv run main.py domains list
+uv run main.py domains move --from-index 4 --to-index 2
+uv run main.py domains check "https://mail.google.com/mail/u/0/#inbox"
+
+# preview resolved allow/deny view for discovered hosts in recent history
+uv run main.py domains preview --since-days 2 --browsers zen
+```
+
+Rules use a leading prefix in config:
+
+- `-pattern` denies a host glob
+- `+pattern` allows a host glob
+- patterns may optionally include a path glob (for example `-mail.google.com/mail/*`)
+- unmatched hosts are allowed by default
+- rules are applied top-to-bottom, and the last matching rule wins
+
+You can also set all rules at once via config:
+
+```bash
+uv run main.py config set ingest.domain_rules -- "-gmail.com,-*.gmail.com,-*.bank.*,+mail.google.com"
+```
+
+Common privacy rule recipes (order matters, last match wins):
+
+```bash
+# block personal inbox + broad banking surfaces
+uv run main.py config set ingest.domain_rules -- "-gmail.com,-*.gmail.com,-*.bank.*,-*.paypal.com"
+
+# allow one work-safe mailbox after a broad deny
+uv run main.py config set ingest.domain_rules -- "-*.google.com,+mail.google.com"
+
+# block only sensitive app routes, keep public pages
+uv run main.py config set ingest.domain_rules -- "-app.example.com/settings/*,-app.example.com/billing/*"
+```
+
+Tip: run `uv run main.py domains preview --since-days 2 --browsers zen` to review the final resolved ALLOW/DENY view before ingesting.
+
 Start `llama-server` in embedding mode. If you plan to send concurrent embedding requests, set `--parallel` to match or exceed your configured worker count:
 
 ```bash
@@ -72,6 +121,12 @@ Run ingestion and print `vec[:10]` previews:
 
 ```bash
 uv run main.py ingest --max-items 20
+```
+
+Run schema-backed ingestion into `tabrewind.sqlite` (managed local DB path):
+
+```bash
+uv run main.py ingest-db --since-days 2 --browsers zen
 ```
 
 Run the live vectorization health test (OpenAI-compatible `/v1/embeddings` on `llama-server`):

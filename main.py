@@ -1,129 +1,45 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import json
-import sqlite3
-import sys
-import tomllib
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
-
-
-def _load_app_types_module() -> object:
-    module_path = Path(__file__).with_name("types.py")
-    spec = importlib.util.spec_from_file_location("tabrewind_app_types", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load application types module at {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_APP_TYPES = _load_app_types_module()
-AppConfig = _APP_TYPES.AppConfig
-EncodedEntryPreview = _APP_TYPES.EncodedEntryPreview
-HistoryEntry = _APP_TYPES.HistoryEntry
-IngestSummary = _APP_TYPES.IngestSummary
-ProfileStore = _APP_TYPES.ProfileStore
 
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
+
+from tabrewind_core.app_types import AppConfig, EncodedEntryPreview, HistoryEntry, IngestSummary, ProfileStore
+from tabrewind_core.config_store import (
+    CONFIG_FILE_NAME,
+    SUPPORTED_BROWSERS,
+    init_config,
+    load_config,
+    parse_csv_list,
+    render_config_toml,
+    save_config,
+    set_config_key,
 )
+from tabrewind_core.domain_policy import (
+    DomainPolicyDecision,
+    DomainRule,
+    compile_domain_rules,
+    format_domain_rule,
+    resolve_domain_policy,
+)
+from tabrewind_core.history_ops import (
+    build_embedding_input,
+    chunk_entries,
+    dedupe_entries,
+    discover_places_files,
+    embed_batch,
+    load_history_entries,
+    normalize_url,
+    run_ingest,
+)
+from tabrewind_core.ingest_db_ops import collect_recent_hosts as _collect_recent_hosts
+from tabrewind_core.ingest_db_ops import run_ingest_db
+from tabrewind_core.vectorization import VectorizationClient, fetch_server_slots
 
 
-CONFIG_FILE_NAME = "config.toml"
-SUPPORTED_BROWSERS = {"zen", "firefox"}
-
-
-class VectorizationClient:
-    def __init__(
-        self,
-        base_url: str,
-        model: str,
-        timeout_seconds: float,
-        api_key: str | None = None,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout_seconds = timeout_seconds
-        self.api_key = api_key
-
-    def _post_json(self, endpoint: str, payload: dict[str, object]) -> dict[str, object]:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        request = Request(
-            url=f"{self.base_url}{endpoint}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"llama-server request failed with HTTP {exc.code}: {details}"
-            ) from exc
-        except URLError as exc:
-            raise RuntimeError(f"Failed to connect to llama-server: {exc.reason}") from exc
-
-        parsed = json.loads(body)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("llama-server returned unexpected JSON response shape")
-        return parsed
-
-    def encode_text(self, text: str) -> list[float]:
-        return self.encode_many([text])[0]
-
-    def encode_many(self, texts: list[str]) -> list[list[float]]:
-        payload = {
-            "input": texts,
-            "model": self.model,
-            "encoding_format": "float",
-        }
-        data = self._post_json("/v1/embeddings", payload)
-        items = data.get("data")
-        if not isinstance(items, list):
-            raise RuntimeError("llama-server response did not include embeddings data")
-
-        vectors: list[list[float] | None] = [None] * len(texts)
-        for position, item in enumerate(items):
-            if not isinstance(item, dict):
-                raise RuntimeError("llama-server response had unexpected embeddings entry")
-            index_raw = item.get("index", position)
-            try:
-                index = int(index_raw)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("llama-server response returned invalid embedding index") from exc
-
-            if index < 0 or index >= len(vectors):
-                raise RuntimeError("llama-server response index out of expected range")
-
-            embedding = item.get("embedding")
-            if not isinstance(embedding, list):
-                raise RuntimeError("llama-server response missing embedding vector")
-            vectors[index] = [float(value) for value in embedding]
-
-        if any(vector is None for vector in vectors):
-            raise RuntimeError("llama-server response omitted one or more embeddings")
-
-        return [vector for vector in vectors if vector is not None]
+INGEST_DB_FILE_NAME = "tabrewind.sqlite"
+_format_domain_rule = format_domain_rule
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,540 +83,210 @@ def parse_args() -> argparse.Namespace:
         help="Optional one-shot override for max deduped items.",
     )
 
+    ingest_db = subparsers.add_parser(
+        "ingest-db",
+        help="Ingest browser history into local SQLite schema.",
+    )
+    ingest_db.add_argument(
+        "--since-days",
+        type=float,
+        default=2.0,
+        help="Only ingest visits from the last N days (default: 2).",
+    )
+    ingest_db.add_argument(
+        "--browsers",
+        type=str,
+        default=None,
+        help="Optional CSV override for browsers (e.g. zen,firefox).",
+    )
+
+    domains = subparsers.add_parser(
+        "domains",
+        help="Manage host allow/deny glob rules.",
+    )
+    domains_subparsers = domains.add_subparsers(dest="domains_command", required=True)
+
+    domains_subparsers.add_parser("list", help="List configured domain rules.")
+
+    domains_add = domains_subparsers.add_parser("add", help="Append a new domain rule.")
+    add_group = domains_add.add_mutually_exclusive_group(required=True)
+    add_group.add_argument("--allow", type=str, help="Allow pattern (without '+' prefix).")
+    add_group.add_argument("--deny", type=str, help="Deny pattern (without '-' prefix).")
+
+    domains_insert = domains_subparsers.add_parser("insert", help="Insert a domain rule by order.")
+    domains_insert.add_argument("--index", type=int, required=True, help="1-based insertion index.")
+    insert_group = domains_insert.add_mutually_exclusive_group(required=True)
+    insert_group.add_argument("--allow", type=str, help="Allow pattern (without '+' prefix).")
+    insert_group.add_argument("--deny", type=str, help="Deny pattern (without '-' prefix).")
+
+    domains_remove = domains_subparsers.add_parser("remove", help="Remove a domain rule by index.")
+    domains_remove.add_argument("--index", type=int, required=True, help="1-based rule index.")
+
+    domains_move = domains_subparsers.add_parser("move", help="Move a domain rule to a new index.")
+    domains_move.add_argument("--from-index", type=int, required=True, help="1-based source index.")
+    domains_move.add_argument("--to-index", type=int, required=True, help="1-based destination index.")
+
+    domains_check = domains_subparsers.add_parser(
+        "check", help="Resolve a single host against configured domain rules."
+    )
+    domains_check.add_argument("host", type=str, help="Host or URL to evaluate.")
+
+    domains_preview = domains_subparsers.add_parser(
+        "preview", help="Preview resolved allow/deny decisions for discovered hosts."
+    )
+    domains_preview.add_argument(
+        "--since-days",
+        type=float,
+        default=2.0,
+        help="Only include hosts with visits from the last N days (default: 2).",
+    )
+    domains_preview.add_argument(
+        "--browsers",
+        type=str,
+        default=None,
+        help="Optional CSV override for browsers (e.g. zen,firefox).",
+    )
+
     return parser.parse_args()
 
 
-def _escape_toml_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def _toml_string_array(values: list[str]) -> str:
-    return "[" + ", ".join(_escape_toml_string(item) for item in values) + "]"
-
-
-def render_config_toml(config: AppConfig) -> str:
-    limit_per_profile = 0 if config.ingest.limit_per_profile is None else config.ingest.limit_per_profile
-    max_items = 0 if config.ingest.max_items is None else config.ingest.max_items
-    lines = [
-        "config_version = 1",
-        "",
-        "[llama]",
-        f"base_url = {_escape_toml_string(config.llama.base_url)}",
-        f"model = {_escape_toml_string(config.llama.model)}",
-        f"api_key = {_escape_toml_string(config.llama.api_key)}",
-        f"request_timeout_seconds = {float(config.llama.request_timeout_seconds)}",
-        "",
-        "[profiles]",
-        f"zen_root = {_escape_toml_string(config.profiles.zen_root)}",
-        f"firefox_root = {_escape_toml_string(config.profiles.firefox_root)}",
-        "",
-        "[ingest]",
-        f"browsers = {_toml_string_array(config.ingest.browsers)}",
-        f"profile_workers = {int(config.ingest.profile_workers)}",
-        f"embedding_workers = {int(config.ingest.embedding_workers)}",
-        f"embedding_batch_size = {int(config.ingest.embedding_batch_size)}",
-        f"limit_per_profile = {int(limit_per_profile)}",
-        f"max_items = {int(max_items)}",
-        f"preview_dims = {int(config.ingest.preview_dims)}",
-        f"llm_tags = {_toml_string_array(config.ingest.llm_tags)}",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def save_config(path: Path, config: AppConfig) -> None:
-    path.write_text(render_config_toml(config), encoding="utf-8")
-
-
-def _as_int(value: object, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_float(value: object, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_string_list(value: object, default: list[str]) -> list[str]:
-    if not isinstance(value, list):
-        return default
-    output = [str(item).strip() for item in value if str(item).strip()]
-    return output or default
-
-
-def _coerce_limit(value: object) -> int | None:
-    parsed = _as_int(value, 0)
-    if parsed <= 0:
-        return None
-    return parsed
-
-
-def load_config(path: Path) -> AppConfig:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Config file not found at {path}. Run `uv run main.py init` first."
-        )
-
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
-
-    config = AppConfig()
-
-    config.config_version = _as_int(raw.get("config_version"), 1)
-
-    llama_data = raw.get("llama", {})
-    if isinstance(llama_data, dict):
-        config.llama.base_url = str(llama_data.get("base_url", config.llama.base_url))
-        config.llama.model = str(llama_data.get("model", config.llama.model))
-        config.llama.api_key = str(llama_data.get("api_key", config.llama.api_key))
-        config.llama.request_timeout_seconds = _as_float(
-            llama_data.get("request_timeout_seconds"),
-            config.llama.request_timeout_seconds,
-        )
-
-    profile_data = raw.get("profiles", {})
-    if isinstance(profile_data, dict):
-        config.profiles.zen_root = str(profile_data.get("zen_root", config.profiles.zen_root))
-        config.profiles.firefox_root = str(
-            profile_data.get("firefox_root", config.profiles.firefox_root)
-        )
-
-    ingest_data = raw.get("ingest", {})
-    if isinstance(ingest_data, dict):
-        browsers = _as_string_list(ingest_data.get("browsers"), config.ingest.browsers)
-        cleaned_browsers = [browser for browser in browsers if browser in SUPPORTED_BROWSERS]
-        config.ingest.browsers = cleaned_browsers or config.ingest.browsers
-        config.ingest.profile_workers = max(
-            1,
-            _as_int(ingest_data.get("profile_workers"), config.ingest.profile_workers),
-        )
-        config.ingest.embedding_workers = max(
-            1,
-            _as_int(ingest_data.get("embedding_workers"), config.ingest.embedding_workers),
-        )
-        config.ingest.embedding_batch_size = max(
-            1,
-            _as_int(
-                ingest_data.get("embedding_batch_size"),
-                config.ingest.embedding_batch_size,
-            ),
-        )
-        config.ingest.limit_per_profile = _coerce_limit(ingest_data.get("limit_per_profile"))
-        config.ingest.max_items = _coerce_limit(ingest_data.get("max_items"))
-        config.ingest.preview_dims = max(
-            1,
-            _as_int(ingest_data.get("preview_dims"), config.ingest.preview_dims),
-        )
-        config.ingest.llm_tags = _as_string_list(ingest_data.get("llm_tags"), [])
-
-    return config
-
-
-def init_config(path: Path, force: bool) -> tuple[AppConfig, bool]:
-    config = AppConfig()
-    existed = path.exists()
-    if existed and not force:
-        return config, False
-
-    save_config(path, config)
-    return config, True
-
-
-def parse_csv_list(value: str) -> list[str]:
-    return [part.strip() for part in value.split(",") if part.strip()]
-
-
-def set_config_key(config: AppConfig, key: str, value: str) -> None:
-    if key == "llama.base_url":
-        config.llama.base_url = value.strip()
-        return
-    if key == "llama.model":
-        config.llama.model = value.strip()
-        return
-    if key == "llama.api_key":
-        config.llama.api_key = value.strip()
-        return
-    if key == "llama.request_timeout_seconds":
-        config.llama.request_timeout_seconds = max(1.0, float(value))
-        return
-    if key == "profiles.zen_root":
-        config.profiles.zen_root = value.strip()
-        return
-    if key == "profiles.firefox_root":
-        config.profiles.firefox_root = value.strip()
-        return
-    if key == "ingest.browsers":
-        browsers = parse_csv_list(value)
-        invalid = [browser for browser in browsers if browser not in SUPPORTED_BROWSERS]
-        if invalid:
-            raise ValueError(f"Unsupported browser(s): {', '.join(invalid)}")
-        config.ingest.browsers = browsers or config.ingest.browsers
-        return
-    if key == "ingest.profile_workers":
-        config.ingest.profile_workers = max(1, int(value))
-        return
-    if key == "ingest.embedding_workers":
-        config.ingest.embedding_workers = max(1, int(value))
-        return
-    if key == "ingest.embedding_batch_size":
-        config.ingest.embedding_batch_size = max(1, int(value))
-        return
-    if key == "ingest.limit_per_profile":
-        parsed = int(value)
-        config.ingest.limit_per_profile = None if parsed <= 0 else parsed
-        return
-    if key == "ingest.max_items":
-        parsed = int(value)
-        config.ingest.max_items = None if parsed <= 0 else parsed
-        return
-    if key == "ingest.preview_dims":
-        config.ingest.preview_dims = max(1, int(value))
-        return
-    if key == "ingest.llm_tags":
-        config.ingest.llm_tags = parse_csv_list(value)
-        return
-
-    supported_keys = [
-        "llama.base_url",
-        "llama.model",
-        "llama.api_key",
-        "llama.request_timeout_seconds",
-        "profiles.zen_root",
-        "profiles.firefox_root",
-        "ingest.browsers",
-        "ingest.profile_workers",
-        "ingest.embedding_workers",
-        "ingest.embedding_batch_size",
-        "ingest.limit_per_profile",
-        "ingest.max_items",
-        "ingest.preview_dims",
-        "ingest.llm_tags",
-    ]
-    raise ValueError(
-        f"Unsupported config key '{key}'. Supported keys: {', '.join(supported_keys)}"
-    )
-
-
-def discover_places_files(browser: str, profile_root: str) -> list[ProfileStore]:
-    root_path = Path(profile_root).expanduser()
-    if not root_path.exists() or not root_path.is_dir():
-        return []
-
-    stores = [
-        ProfileStore(browser=browser, db_path=path)
-        for path in sorted(root_path.glob("*/places.sqlite"))
-        if path.is_file()
-    ]
-    return stores
-
-
-def normalize_url(url: str) -> str | None:
-    value = url.strip()
-    if not value:
-        return None
-
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return None
-
-    scheme = parsed.scheme.lower()
-    if not scheme:
-        return None
-
-    host = (parsed.hostname or "").lower()
-    if scheme in {"http", "https"} and not host:
-        return None
-
-    netloc = parsed.netloc.lower()
-    if host:
-        try:
-            port = parsed.port
-        except ValueError:
-            return None
-        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
-            port = None
-        userinfo = ""
-        if parsed.username:
-            userinfo = parsed.username
-            if parsed.password:
-                userinfo = f"{userinfo}:{parsed.password}"
-            userinfo = f"{userinfo}@"
-        netloc = f"{userinfo}{host}"
-        if port is not None:
-            netloc = f"{netloc}:{port}"
-
-    path = parsed.path or "/"
-    return urlunsplit((scheme, netloc, path, parsed.query, ""))
-
-
-def load_history_entries(
-    store: ProfileStore,
-    limit_per_profile: int | None,
-) -> tuple[list[HistoryEntry], str | None]:
-    uri = f"file:{store.db_path.as_posix()}?mode=ro&immutable=1"
-    query = (
-        "SELECT p.url, COALESCE(p.title, ''), COALESCE(p.last_visit_date, 0) "
-        "FROM moz_places AS p "
-        "WHERE p.url IS NOT NULL AND TRIM(p.url) != '' "
-        "ORDER BY COALESCE(p.last_visit_date, 0) DESC, p.id DESC"
-    )
-
-    rows: list[HistoryEntry] = []
-    profile_name = store.db_path.parent.name
-    try:
-        with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
-            cursor = conn.cursor()
-            if limit_per_profile is None:
-                cursor.execute(query)
-            else:
-                cursor.execute(f"{query} LIMIT ?", (limit_per_profile,))
-
-            for url_value, title_value, last_visit_date in cursor:
-                canonical = normalize_url(url_value)
-                if canonical is None:
-                    continue
-
-                title = title_value.strip() if isinstance(title_value, str) else ""
-                if not title:
-                    title = "(untitled)"
-
-                rows.append(
-                    HistoryEntry(
-                        browser=store.browser,
-                        profile=profile_name,
-                        title=title,
-                        url=url_value,
-                        canonical_url=canonical,
-                        last_visit_date=int(last_visit_date),
-                    )
-                )
-    except sqlite3.Error as exc:
-        return [], f"{store.browser}:{profile_name} ({store.db_path.name}) -> {exc}"
-
-    return rows, None
-
-
-def dedupe_entries(entries: list[HistoryEntry]) -> list[HistoryEntry]:
-    by_url: dict[str, HistoryEntry] = {}
-    for item in entries:
-        existing = by_url.get(item.canonical_url)
-        if existing is None:
-            by_url[item.canonical_url] = item
-            continue
-
-        replacement_needed = False
-        if item.last_visit_date > existing.last_visit_date:
-            replacement_needed = True
-        elif item.last_visit_date == existing.last_visit_date:
-            if (item.browser, item.profile, item.url) < (
-                existing.browser,
-                existing.profile,
-                existing.url,
-            ):
-                replacement_needed = True
-
-        if replacement_needed:
-            by_url[item.canonical_url] = item
-
-    return sorted(
-        by_url.values(),
-        key=lambda item: (-item.last_visit_date, item.canonical_url, item.title),
-    )
-
-
-def build_embedding_input(entry: HistoryEntry) -> str:
-    return f"title: {entry.title}\nurl: {entry.canonical_url}"
-
-
-def fetch_server_slots(base_url: str, timeout_seconds: float) -> int | None:
-    request = Request(url=f"{base_url.rstrip('/')}/slots", method="GET")
-    try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return None
-
-    if isinstance(data, list):
-        return max(1, len(data))
-    if isinstance(data, dict):
-        total_slots = data.get("total_slots")
-        try:
-            return max(1, int(total_slots))
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def chunk_entries(entries: list[HistoryEntry], batch_size: int) -> list[tuple[int, list[HistoryEntry]]]:
-    chunks: list[tuple[int, list[HistoryEntry]]] = []
-    for start in range(0, len(entries), batch_size):
-        chunks.append((start, entries[start : start + batch_size]))
-    return chunks
-
-
-def embed_batch(
-    client: VectorizationClient,
-    entries: list[HistoryEntry],
-    preview_dims: int,
-    llm_tags: list[str] | None,
-) -> list[EncodedEntryPreview]:
-    inputs = [build_embedding_input(entry) for entry in entries]
-    vectors = client.encode_many(inputs)
-    previews: list[EncodedEntryPreview] = []
-    for entry, vector in zip(entries, vectors, strict=True):
-        previews.append(
-            EncodedEntryPreview(
-                entry=entry,
-                vector_preview=vector[:preview_dims],
-                llm_tags=llm_tags,
-            )
-        )
-    return previews
-
-
-def run_ingest(config: AppConfig) -> IngestSummary:
-    console = Console(stderr=False)
-    selected_browsers = [browser for browser in config.ingest.browsers if browser in SUPPORTED_BROWSERS]
-    if not selected_browsers:
-        selected_browsers = ["zen", "firefox"]
-
-    discovered_profiles: list[ProfileStore] = []
-    load_errors: list[str] = []
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        discovery_task = progress.add_task(
-            "Discovering browser profiles", total=len(selected_browsers)
-        )
-        for browser in selected_browsers:
-            root = config.profiles.zen_root if browser == "zen" else config.profiles.firefox_root
-            discovered_profiles.extend(discover_places_files(browser, root))
-            progress.advance(discovery_task)
-
-        if not discovered_profiles:
-            return IngestSummary(
-                discovered_profile_count=0,
-                loaded_row_count=0,
-                deduped_row_count=0,
-                effective_embedding_workers=max(1, config.ingest.embedding_workers),
-                previews=[],
-                load_errors=[],
-                embed_errors=[],
-            )
-
-        history_task = progress.add_task(
-            "Loading history rows", total=len(discovered_profiles)
-        )
-        all_entries: list[HistoryEntry] = []
-        with ThreadPoolExecutor(max_workers=max(1, config.ingest.profile_workers)) as executor:
-            futures = {
-                executor.submit(
-                    load_history_entries,
-                    store,
-                    config.ingest.limit_per_profile,
-                ): store
-                for store in discovered_profiles
-            }
-            for future in as_completed(futures):
-                rows, error = future.result()
-                all_entries.extend(rows)
-                if error:
-                    load_errors.append(error)
-                progress.advance(history_task)
-
-        deduped_entries = dedupe_entries(all_entries)
-        if config.ingest.max_items is not None:
-            deduped_entries = deduped_entries[: max(0, config.ingest.max_items)]
-
-        if not deduped_entries:
-            return IngestSummary(
-                discovered_profile_count=len(discovered_profiles),
-                loaded_row_count=len(all_entries),
-                deduped_row_count=0,
-                effective_embedding_workers=max(1, config.ingest.embedding_workers),
-                previews=[],
-                load_errors=load_errors,
-                embed_errors=[],
-            )
-
-        slots = fetch_server_slots(
-            base_url=config.llama.base_url,
-            timeout_seconds=config.llama.request_timeout_seconds,
-        )
-        configured_workers = max(1, config.ingest.embedding_workers)
-        if slots is None:
-            effective_workers = configured_workers
+def _render_domain_decision_status(decision: DomainPolicyDecision) -> str:
+    if decision.allowed:
+        return "[green]ALLOW[/green]"
+    return "[red]DENY[/red]"
+
+
+def run_domains_command(args: argparse.Namespace, console: Console) -> int:
+    config_path: Path = args.config
+    config = load_config(config_path)
+
+    if args.domains_command == "list":
+        compiled = compile_domain_rules(config.ingest.domain_rules)
+        if not compiled:
+            console.print("No domain rules configured.")
+            console.print("Default policy: [green]ALLOW[/green] when no rule matches.")
+            return 0
+
+        console.print("Domain rules (top to bottom, last match wins):")
+        for rule in compiled:
+            status = "[green]+ allow[/green]" if rule.action == "allow" else "[red]- deny[/red]"
+            console.print(f"{rule.index}. {status} {rule.pattern}")
+        return 0
+
+    if args.domains_command in {"add", "insert"}:
+        action = "allow" if getattr(args, "allow", None) is not None else "deny"
+        pattern = args.allow if action == "allow" else args.deny
+        rule = _format_domain_rule(action, pattern)
+        updated = list(config.ingest.domain_rules)
+        if args.domains_command == "add":
+            updated.append(rule)
         else:
-            effective_workers = max(1, min(configured_workers, slots))
+            index = int(args.index)
+            if index <= 0:
+                raise ValueError("Rule index must be >= 1")
+            insert_at = min(index - 1, len(updated))
+            updated.insert(insert_at, rule)
 
-        vector_client = VectorizationClient(
-            base_url=config.llama.base_url,
-            model=config.llama.model,
-            timeout_seconds=config.llama.request_timeout_seconds,
-            api_key=config.llama.api_key,
-        )
+        compile_domain_rules(updated)
+        config.ingest.domain_rules = updated
+        save_config(config_path, config)
+        console.print(f"Added rule {rule}")
+        return 0
 
-        chunks = chunk_entries(
-            deduped_entries,
-            max(1, config.ingest.embedding_batch_size),
-        )
-        embed_task = progress.add_task(
-            "Requesting embeddings", total=len(deduped_entries)
-        )
-        embed_errors: list[str] = []
-        previews: list[EncodedEntryPreview | None] = [None] * len(deduped_entries)
+    if args.domains_command == "remove":
+        updated = list(config.ingest.domain_rules)
+        if not updated:
+            raise ValueError("No domain rules configured")
+        index = int(args.index)
+        if index <= 0 or index > len(updated):
+            raise ValueError(f"Rule index out of range: {index}")
+        removed = updated.pop(index - 1)
+        compile_domain_rules(updated)
+        config.ingest.domain_rules = updated
+        save_config(config_path, config)
+        console.print(f"Removed rule {removed}")
+        return 0
 
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            futures = {
-                executor.submit(
-                    embed_batch,
-                    vector_client,
-                    batch,
-                    config.ingest.preview_dims,
-                    config.ingest.llm_tags or None,
-                ): start
-                for start, batch in chunks
-            }
-            for future in as_completed(futures):
-                start_index = futures[future]
-                batch_size = min(
-                    config.ingest.embedding_batch_size,
-                    len(deduped_entries) - start_index,
+    if args.domains_command == "move":
+        updated = list(config.ingest.domain_rules)
+        if not updated:
+            raise ValueError("No domain rules configured")
+        from_index = int(args.from_index)
+        to_index = int(args.to_index)
+        if from_index <= 0 or from_index > len(updated):
+            raise ValueError(f"from-index out of range: {from_index}")
+        if to_index <= 0:
+            raise ValueError("to-index must be >= 1")
+        item = updated.pop(from_index - 1)
+        destination = min(to_index - 1, len(updated))
+        updated.insert(destination, item)
+        compile_domain_rules(updated)
+        config.ingest.domain_rules = updated
+        save_config(config_path, config)
+        console.print(f"Moved rule {item} to position {destination + 1}")
+        return 0
+
+    compiled = compile_domain_rules(config.ingest.domain_rules)
+    if args.domains_command == "check":
+        decision = resolve_domain_policy(args.host, compiled)
+        status = _render_domain_decision_status(decision)
+        console.print(f"{status} {decision.host}")
+        if decision.winning_rule is None:
+            console.print("Winning rule: (none) -> default allow")
+        else:
+            winning = decision.winning_rule
+            marker = "[green]allow[/green]" if winning.action == "allow" else "[red]deny[/red]"
+            console.print(f"Winning rule: #{winning.index} {marker} {winning.pattern}")
+
+        if decision.matched_rules:
+            console.print("Matched rules:")
+            for rule in decision.matched_rules:
+                marker = "[green]allow[/green]" if rule.action == "allow" else "[red]deny[/red]"
+                console.print(f"- #{rule.index} {marker} {rule.pattern}")
+        return 0
+
+    if args.domains_command == "preview":
+        browsers_override: list[str] | None = None
+        if args.browsers:
+            browsers_override = parse_csv_list(args.browsers)
+            invalid = [browser for browser in browsers_override if browser not in SUPPORTED_BROWSERS]
+            if invalid:
+                raise ValueError(f"Unsupported browser(s): {', '.join(invalid)}")
+
+        hosts, errors = _collect_recent_hosts(
+            config,
+            since_days=args.since_days,
+            browsers_override=browsers_override,
+        )
+        if not hosts:
+            console.print("No hosts discovered for preview window.")
+        allowed_count = 0
+        denied_count = 0
+        for host in hosts:
+            decision = resolve_domain_policy(host, compiled)
+            status = _render_domain_decision_status(decision)
+            if decision.allowed:
+                allowed_count += 1
+            else:
+                denied_count += 1
+            if decision.winning_rule is None:
+                console.print(f"{status} {host} (default)")
+            else:
+                marker = "allow" if decision.winning_rule.action == "allow" else "deny"
+                console.print(
+                    f"{status} {host} (rule #{decision.winning_rule.index}: {marker} {decision.winning_rule.pattern})"
                 )
-                try:
-                    batch_previews = future.result()
-                    for offset, preview in enumerate(batch_previews):
-                        previews[start_index + offset] = preview
-                except Exception as exc:
-                    entry = deduped_entries[start_index]
-                    embed_errors.append(
-                        f"embedding failed for {entry.browser}:{entry.profile} {entry.canonical_url}: {exc}"
-                    )
-                progress.advance(embed_task, advance=batch_size)
 
-    finalized_previews = [preview for preview in previews if preview is not None]
-    return IngestSummary(
-        discovered_profile_count=len(discovered_profiles),
-        loaded_row_count=len(all_entries),
-        deduped_row_count=len(deduped_entries),
-        effective_embedding_workers=effective_workers,
-        previews=finalized_previews,
-        load_errors=load_errors,
-        embed_errors=embed_errors,
-    )
+        console.print(
+            f"Resolved hosts: total={len(hosts)} [green]allowed={allowed_count}[/green] [red]denied={denied_count}[/red]"
+        )
+        if errors:
+            console.print("Profile read errors:")
+            for message in errors:
+                console.print(f"- {message}")
+        return 0
+
+    raise RuntimeError(f"Unknown domains command: {args.domains_command}")
 
 
 def run_init_command(args: argparse.Namespace, console: Console) -> int:
@@ -771,6 +357,52 @@ def run_ingest_command(args: argparse.Namespace, console: Console) -> int:
     return 0
 
 
+def run_ingest_db_command(args: argparse.Namespace, console: Console) -> int:
+    config = load_config(args.config)
+    db_path = Path(INGEST_DB_FILE_NAME)
+
+    browsers_override: list[str] | None = None
+    if args.browsers:
+        browsers_override = parse_csv_list(args.browsers)
+        invalid = [browser for browser in browsers_override if browser not in SUPPORTED_BROWSERS]
+        if invalid:
+            raise ValueError(f"Unsupported browser(s): {', '.join(invalid)}")
+
+    result = run_ingest_db(
+        config,
+        db_path=db_path,
+        since_days=args.since_days,
+        browsers_override=browsers_override,
+    )
+
+    console.print(
+        "DB ingest complete: "
+        f"profiles={result['discovered_profiles']} "
+        f"source_rows={result['source_rows']} "
+        f"allowed_rows={result['filtered_allowed_rows']} "
+        f"denied_rows={result['filtered_denied_rows']} "
+        f"pages_touched={result['pages_touched']} "
+        f"visits_inserted={result['visits_inserted']} "
+        f"fts_synced={result['fts_rows_synced']} "
+        f"embeddings_synced={result['embeddings_synced']}"
+    )
+    console.print(f"DB path: {result['db_path']}")
+
+    load_errors = result["load_errors"]
+    if isinstance(load_errors, list) and load_errors:
+        console.print("Profile read errors:")
+        for message in load_errors:
+            console.print(f"- {message}")
+
+    embed_errors = result["embed_errors"]
+    if isinstance(embed_errors, list) and embed_errors:
+        console.print("Embedding sync errors:")
+        for message in embed_errors:
+            console.print(f"- {message}")
+
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     console = Console(stderr=False)
@@ -781,6 +413,10 @@ def main() -> int:
         return run_config_command(args, console)
     if args.command == "ingest":
         return run_ingest_command(args, console)
+    if args.command == "ingest-db":
+        return run_ingest_db_command(args, console)
+    if args.command == "domains":
+        return run_domains_command(args, console)
     raise RuntimeError(f"Unknown command: {args.command}")
 
 
